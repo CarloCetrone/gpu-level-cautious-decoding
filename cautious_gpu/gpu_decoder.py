@@ -218,6 +218,7 @@ class GPUCautiousDecoder:
         depth: Optional[int] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        commit_depth: Optional[int] = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         """Executes GPU-accelerated Cautious Tree Search Decoding."""
@@ -248,6 +249,7 @@ class GPUCautiousDecoder:
             depth=depth,
             max_tokens=max_tokens,
             temperature=temperature,
+            commit_depth=commit_depth,
             verbose=verbose,
         )
 
@@ -258,6 +260,7 @@ class GPUCautiousDecoder:
         depth: int,
         max_tokens: int,
         temperature: float,
+        commit_depth: Optional[int] = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         """Executes Cautious Tree Search Decoding directly on vLLM engine.
@@ -396,22 +399,34 @@ class GPUCautiousDecoder:
             mean_neg_lp = -torch.mean(lps_tensor, dim=-1)
             path_ppls = torch.exp(mean_neg_lp)
             best_idx = torch.argmin(path_ppls).item()
-
             best_out = outputs[best_idx]
-            winning_token = best_out.token_ids[0]
             winning_ppl = path_ppls[best_idx].item()
+            winning_tokens = list(best_out.token_ids)
+            if commit_depth is not None and commit_depth > 0:
+                winning_tokens = winning_tokens[:commit_depth]
+            else:
+                winning_tokens = winning_tokens[:depth]
 
-            committed_tokens.append(winning_token)
+            remaining = max_tokens - len(committed_tokens)
+            winning_tokens = winning_tokens[:remaining]
+
+            hit_eos = False
+            if self.eos_token_id is not None and self.eos_token_id in winning_tokens:
+                eos_idx = winning_tokens.index(self.eos_token_id)
+                winning_tokens = winning_tokens[:eos_idx + 1]
+                hit_eos = True
+
+            committed_tokens.extend(winning_tokens)
             num_prunings += 1
 
             if verbose:
-                tok_str = self.tokenizer.decode([winning_token]) if self.tokenizer else str(winning_token)
+                tok_str = self.tokenizer.decode(winning_tokens) if self.tokenizer else str(winning_tokens)
                 print(
-                    f"[GPU CTSD Commit] Token: {tok_str!r} (ID: {winning_token}) | "
+                    f"[GPU CTSD Commit] Tokens: {tok_str!r} ({len(winning_tokens)} tokens) | "
                     f"PPL: {winning_ppl:.2f}"
                 )
 
-            if winning_token == self.eos_token_id:
+            if hit_eos or len(committed_tokens) >= max_tokens:
                 break
 
         elapsed = time.time() - start_time

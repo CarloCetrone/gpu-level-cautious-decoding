@@ -24,6 +24,7 @@ def register():
             depth: int = 3,
             max_tokens: int = 512,
             temperature: float = 0.7,
+            commit_depth: Optional[int] = None,
             verbose: bool = False,
         ) -> Dict[str, Any]:
             """GPU-level Cautious Tree Search Decoding.
@@ -34,6 +35,7 @@ def register():
                 depth: Lookahead exploration depth D.
                 max_tokens: Maximum tokens to generate.
                 temperature: Sampling temperature for candidate distribution.
+                commit_depth: Number of tokens to commit per exploration (default: depth).
                 verbose: If True, logs step-by-step commitment info.
             """
             decoder = GPUCautiousDecoder(
@@ -45,6 +47,7 @@ def register():
             )
             return decoder.generate(
                 prompt=prompt,
+                commit_depth=commit_depth,
                 verbose=verbose,
             )
 
