@@ -30,6 +30,11 @@ def crop_past_key_values(past_key_values: Any, prefix_len: int) -> Any:
     if hasattr(past_key_values, "crop"):
         past_key_values.crop(prefix_len)
         return past_key_values
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        for i in range(len(past_key_values.key_cache)):
+            past_key_values.key_cache[i] = past_key_values.key_cache[i][:, :, :prefix_len, :]
+            past_key_values.value_cache[i] = past_key_values.value_cache[i][:, :, :prefix_len, :]
+        return past_key_values
     cropped = []
     for layer in past_key_values:
         if isinstance(layer, (tuple, list)):
@@ -38,6 +43,52 @@ def crop_past_key_values(past_key_values: Any, prefix_len: int) -> Any:
         else:
             cropped.append(layer)
     return tuple(cropped)
+
+
+def generate_tree_candidates_gpu(
+    top_b_ids: torch.Tensor,
+    last_logits: torch.Tensor,
+    full_sequence_ids: torch.Tensor,
+    topology: GPUTreeTopology,
+) -> torch.Tensor:
+    """Populates candidate tokens for all tree nodes directly on GPU.
+
+    - Level 1 (nodes 0..B-1): top-B tokens from last_logits.
+    - Level 2..D: populated via GPU prompt n-gram lookahead and top-k candidate expansion.
+    """
+    device = top_b_ids.device
+    num_nodes = topology.num_candidate_nodes
+    breadth = topology.breadth
+
+    tree_tokens = torch.zeros((1, num_nodes), dtype=torch.long, device=device)
+    tree_tokens[0, :breadth] = top_b_ids[0]
+
+    if num_nodes == breadth:
+        return tree_tokens
+
+    # Top fallback tokens from last_logits [num_nodes]
+    _, fallback_topk = torch.topk(last_logits, min(num_nodes, last_logits.size(-1)), dim=-1)
+    fallback_ids = fallback_topk[0]
+
+    seq_len = full_sequence_ids.size(0)
+    for i in range(breadth, num_nodes):
+        parent_idx = topology.candidate_parent_indices[i].item()
+        parent_tok = tree_tokens[0, parent_idx].item()
+        child_branch = (i - breadth) % breadth
+
+        found = False
+        if seq_len > 1:
+            matches = (full_sequence_ids[:-1] == parent_tok).nonzero(as_tuple=True)[0]
+            if len(matches) > 0:
+                match_pos = matches[-1].item() + 1 + child_branch
+                if match_pos < seq_len:
+                    tree_tokens[0, i] = full_sequence_ids[match_pos]
+                    found = True
+
+        if not found:
+            tree_tokens[0, i] = fallback_ids[i % fallback_ids.size(0)]
+
+    return tree_tokens
 
 
 def _extract_model_from_llm(llm: Any) -> Optional[torch.nn.Module]:
@@ -451,11 +502,14 @@ class GPUCautiousDecoder:
             tree_mask = self.topology.get_4d_tree_attention_mask(prefix_len, dtype=last_logits.dtype)
             tree_pos = self.topology.get_tree_position_ids(prefix_len)
 
-            # Candidate tokens tensor [1, num_candidate_nodes]
-            tree_candidate_tokens = torch.zeros(
-                (1, self.topology.num_candidate_nodes), dtype=torch.long, device=self.device
+            # Candidate tokens tensor [1, num_candidate_nodes] populated on GPU
+            full_seq = torch.tensor(prompt_token_ids + committed_tokens, dtype=torch.long, device=self.device)
+            tree_candidate_tokens = generate_tree_candidates_gpu(
+                top_b_ids=top_b_ids,
+                last_logits=last_logits,
+                full_sequence_ids=full_seq,
+                topology=self.topology,
             )
-            tree_candidate_tokens[0, :breadth] = top_b_ids[0]
 
             saved_prefix_len = prefix_len
 

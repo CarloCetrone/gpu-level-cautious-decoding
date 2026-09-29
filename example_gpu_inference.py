@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Benchmark & Inference Script: GPU-Level Cautious Tree Search Decoding vs Standard vLLM Baseline.
+Benchmark & Inference Script: Pure GPU-Level Cautious Tree Search Decoding (Medusa-style Tree Attention)
+vs Standard Greedy Autoregressive Baseline on GPU.
 """
 
 import time
 import torch
-import vllm
-import cautious_gpu
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from cautious_gpu import GPUCautiousDecoder
 
 
 def main():
@@ -16,49 +17,55 @@ def main():
     breadth = 3
     depth = 3
     temperature = 0.7
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=================================================================")
-    print(f"Loading Model: {model_name} with Prefix Caching...")
+    print(f"Loading Model: {model_name} on {device}...")
     print("=================================================================")
-    llm = vllm.LLM(
-        model=model_name,
-        enable_prefix_caching=True,
-        max_model_len=2048,
-        gpu_memory_utilization=0.85,
-        disable_log_stats=True,
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map=device if device == "cuda" else None,
     )
+    if device == "cuda" and hasattr(model, "cuda"):
+        model = model.cuda()
 
     # -------------------------------------------------------------
-    # 1. Standard vLLM Baseline
+    # 1. Standard PyTorch Baseline (Greedy Autoregressive)
     # -------------------------------------------------------------
-    print("\n[1/2] Running Standard vLLM Baseline (Greedy)...")
-    baseline_params = vllm.SamplingParams(
-        max_tokens=max_tokens,
-        temperature=0.0,
-    )
+    print("\n[1/2] Running Standard PyTorch Baseline (Greedy)...")
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     t0 = time.time()
-    baseline_outs = llm.generate(prompts=[prompt], sampling_params=baseline_params, use_tqdm=False)
+    with torch.inference_mode():
+        baseline_outs = model.generate(
+            input_ids,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
     baseline_time = time.time() - t0
-
-    baseline_tokens = len(baseline_outs[0].outputs[0].token_ids)
+    baseline_tokens = baseline_outs.shape[1] - input_ids.shape[1]
     baseline_tps = baseline_tokens / max(baseline_time, 1e-4)
-    baseline_text = baseline_outs[0].outputs[0].text.strip()
+    baseline_text = tokenizer.decode(baseline_outs[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
     print(f"Baseline Time: {baseline_time:.2f}s | Speed: {baseline_tps:.2f} tokens/s")
     print(f"Generated ({baseline_tokens} tokens):\n{baseline_text}\n")
 
     # -------------------------------------------------------------
-    # 2. GPU Cautious Tree Search Decoding (Medusa-style Tree Execution)
+    # 2. Native GPU Cautious Tree Search Decoding (Medusa-style Tree Attention)
     # -------------------------------------------------------------
-    print(f"\n[2/2] Running GPU Cautious Tree Search Decoding (B={breadth}, D={depth}, B^D={breadth**depth} paths)...")
-    gpu_result = llm.gpu_cautious_generate(
-        prompt=prompt,
+    print(f"\n[2/2] Running Native GPU Tree Attention CTSD (B={breadth}, D={depth}, B^D={breadth**depth} paths)...")
+    decoder = GPUCautiousDecoder(
+        llm=model,
+        tokenizer=tokenizer,
         breadth=breadth,
         depth=depth,
         temperature=temperature,
         max_tokens=max_tokens,
-        verbose=False,
+        device=device,
     )
+    gpu_result = decoder.generate(prompt=prompt, verbose=False)
 
     gpu_tokens = gpu_result["num_committed_tokens"]
     gpu_tps = gpu_result["tokens_per_second"]
