@@ -11,10 +11,36 @@ from typing import Tuple
 
 _CUDA_EXT = None
 
+# 1. Try importing pre-compiled extension
 try:
     import cautious_decoding_cuda as _CUDA_EXT
 except ImportError:
     pass
+
+# 2. If not pre-compiled, attempt on-demand JIT compilation via torch.utils.cpp_extension
+if _CUDA_EXT is None and torch.cuda.is_available():
+    try:
+        import os
+        from torch.utils.cpp_extension import load
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        csrc_dir = os.path.abspath(os.path.join(current_dir, "..", "csrc"))
+        sources = [
+            os.path.join(csrc_dir, "bindings.cpp"),
+            os.path.join(csrc_dir, "tree_scoring.cu"),
+            os.path.join(csrc_dir, "tree_attention.cu"),
+        ]
+        if all(os.path.exists(s) for s in sources):
+            _CUDA_EXT = load(
+                name="cautious_decoding_cuda",
+                sources=sources,
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O3", "--use_fast_math"],
+                verbose=False,
+            )
+    except Exception:
+        # Fall back to PyTorch GPU vectorized operations
+        _CUDA_EXT = None
 
 
 def temperature_scale_normalize_gpu(

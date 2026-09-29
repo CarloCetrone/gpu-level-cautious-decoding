@@ -41,14 +41,15 @@ __global__ void build_tree_attention_mask_kernel(
 torch::Tensor build_tree_attention_mask_cuda(
     torch::Tensor parent_indices // [num_tokens] on CUDA
 ) {
-    int num_tokens = parent_indices.size(0);
+    auto parents = parent_indices.to(torch::kInt32).contiguous();
+    int num_tokens = parents.size(0);
     auto mask = torch::zeros({num_tokens, num_tokens}, torch::dtype(torch::kBool).device(parent_indices.device()));
 
     dim3 threads(16, 16);
     dim3 blocks((num_tokens + 15) / 16, (num_tokens + 15) / 16);
 
     build_tree_attention_mask_kernel<<<blocks, threads>>>(
-        parent_indices.data_ptr<int>(),
+        parents.data_ptr<int>(),
         mask.data_ptr<bool>(),
         num_tokens
     );

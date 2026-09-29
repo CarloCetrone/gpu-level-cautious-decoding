@@ -75,19 +75,23 @@ torch::Tensor compute_path_perplexities_cuda(
     torch::Tensor path_node_indices,  // [num_paths, depth]
     torch::Tensor path_child_indices  // [num_paths, depth]
 ) {
-    int num_paths = path_node_indices.size(0);
-    int depth = path_node_indices.size(1);
-    int breadth = candidate_logprobs.size(1);
+    auto cand_lp = candidate_logprobs.to(torch::kFloat32).contiguous();
+    auto path_nodes = path_node_indices.to(torch::kInt32).contiguous();
+    auto path_children = path_child_indices.to(torch::kInt32).contiguous();
 
-    auto path_ppls = torch::empty({num_paths}, candidate_logprobs.options());
+    int num_paths = path_nodes.size(0);
+    int depth = path_nodes.size(1);
+    int breadth = cand_lp.size(1);
+
+    auto path_ppls = torch::empty({num_paths}, cand_lp.options());
 
     int threads = 256;
     int blocks = (num_paths + threads - 1) / threads;
 
     compute_path_perplexity_kernel<<<blocks, threads>>>(
-        candidate_logprobs.data_ptr<float>(),
-        path_node_indices.data_ptr<int>(),
-        path_child_indices.data_ptr<int>(),
+        cand_lp.data_ptr<float>(),
+        path_nodes.data_ptr<int>(),
+        path_children.data_ptr<int>(),
         path_ppls.data_ptr<float>(),
         num_paths,
         depth,
@@ -101,16 +105,17 @@ torch::Tensor temperature_scale_normalize_cuda(
     torch::Tensor raw_logprobs, // [num_nodes, breadth]
     float temperature
 ) {
-    int num_nodes = raw_logprobs.size(0);
-    int breadth = raw_logprobs.size(1);
+    auto raw_lp = raw_logprobs.to(torch::kFloat32).contiguous();
+    int num_nodes = raw_lp.size(0);
+    int breadth = raw_lp.size(1);
 
-    auto scaled_logprobs = torch::empty_like(raw_logprobs);
+    auto scaled_logprobs = torch::empty_like(raw_lp);
 
     int threads = 256;
     int blocks = (num_nodes + threads - 1) / threads;
 
     temperature_scale_normalize_kernel<<<blocks, threads>>>(
-        raw_logprobs.data_ptr<float>(),
+        raw_lp.data_ptr<float>(),
         scaled_logprobs.data_ptr<float>(),
         num_nodes,
         breadth,

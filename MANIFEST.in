@@ -1,0 +1,5 @@
+recursive-include csrc *.cpp *.cu *.h
+recursive-include cautious_gpu *.py
+include LICENSE
+include README.md
+include pyproject.toml
