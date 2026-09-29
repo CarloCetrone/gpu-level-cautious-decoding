@@ -50,10 +50,15 @@ class MockLLM:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         self.step_count += len(prompts)
         outs = []
+        n = getattr(sampling_params, "n", 1) if not isinstance(sampling_params, dict) else sampling_params.get("n", 1)
         for i, p in enumerate(prompts):
-            pids = p["prompt_token_ids"]
-            out = MockRequestOutput(token_id=200 + i, logprob_val=-0.5)
-            outs.append(out)
+            req_out = MockRequestOutput(token_id=200 + i, logprob_val=-0.5)
+            req_out.outputs = [
+                MockCompletionOutput(token_id=200 + i + b, logprob_val=-0.5 - 0.1 * b)
+                for b in range(n)
+            ]
+            req_out.outputs[0].text = " mock generated text"
+            outs.append(req_out)
         return outs
 
 
@@ -152,3 +157,20 @@ def test_gpu_cautious_decoder_native_model():
     assert result["num_committed_tokens"] == 3
     assert result["stats"]["execution_mode"] == "native_tree_attention"
     assert result["stats"]["num_prunings"] >= 1
+
+
+def test_gpu_cautious_decoder_vllm_d1():
+    mock_llm = MockLLM()
+    decoder = GPUCautiousDecoder(
+        llm=mock_llm,
+        breadth=1,
+        depth=1,
+        max_tokens=5,
+    )
+
+    result = decoder.generate(prompt="Hello", verbose=False)
+    assert result["stats"]["execution_mode"] == "vllm_engine"
+    assert result["tokens_per_second"] > 0
+    assert result["stats"]["depth"] == 1
+    assert result["stats"]["breadth"] == 1
+

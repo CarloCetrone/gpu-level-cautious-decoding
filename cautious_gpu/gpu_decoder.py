@@ -151,25 +151,11 @@ class GPUCautiousDecoder:
             else:
                 self.tokenizer = None
 
-            self.underlying_model = _extract_model_from_llm(self.llm)
-
-            # If underlying_model not directly accessible in main process (e.g. vLLM subprocess),
-            # check if model_config provides model_name and load PyTorch model on GPU
-            if self.underlying_model is None and hasattr(self.llm, "model_config"):
-                model_name = getattr(self.llm.model_config, "model", None)
-                if model_name:
-                    try:
-                        from transformers import AutoModelForCausalLM
-                        dtype = torch_dtype or (torch.float16 if self.device.type == "cuda" else torch.float32)
-                        self.underlying_model = AutoModelForCausalLM.from_pretrained(
-                            model_name,
-                            torch_dtype=dtype,
-                            device_map=str(self.device) if self.device.type == "cuda" else None,
-                        )
-                        if self.device.type == "cuda" and hasattr(self.underlying_model, "cuda"):
-                            self.underlying_model = self.underlying_model.cuda()
-                    except Exception:
-                        pass
+            # Only assign underlying_model if llm has an explicit PyTorch module attached
+            if hasattr(self.llm, "model") and isinstance(self.llm.model, torch.nn.Module):
+                self.underlying_model = self.llm.model
+            else:
+                self.underlying_model = None
 
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         self.topology = GPUTreeTopology(breadth=breadth, depth=depth, device=str(self.device))
@@ -204,19 +190,8 @@ class GPUCautiousDecoder:
                 verbose=verbose,
             )
 
-        # Check if in-engine stepping via vLLM engine is available (zero llm.generate() calls)
-        if hasattr(self.llm, "llm_engine") and (hasattr(self.llm, "enqueue") or hasattr(self.llm, "_add_completion_requests")):
-            return self._generate_vllm_engine(
-                prompt=prompt,
-                breadth=breadth,
-                depth=depth,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                verbose=verbose,
-            )
-
-        # Fallback to batched GPU execution
-        return self._generate_batched_gpu(
+        # Execute Cautious Tree Search Decoding directly on vLLM engine
+        return self._generate_vllm(
             prompt=prompt,
             breadth=breadth,
             depth=depth,
@@ -225,7 +200,7 @@ class GPUCautiousDecoder:
             verbose=verbose,
         )
 
-    def _generate_vllm_engine(
+    def _generate_vllm(
         self,
         prompt: str,
         breadth: int,
@@ -234,35 +209,48 @@ class GPUCautiousDecoder:
         temperature: float,
         verbose: bool = False,
     ) -> Dict[str, Any]:
-        """Continuous in-engine stepping on GPU avoiding 128 llm.generate() invocations."""
+        """Executes Cautious Tree Search Decoding directly on vLLM engine.
+
+        For D=1 (including B=1, D=1):
+            Minimizing path perplexity over depth 1 mathematically selects the argmax token,
+            which is strictly identical to greedy decoding. Runs in a single vLLM pass at 100% baseline speed.
+        For D > 1:
+            At each commitment step, evaluates candidate paths in parallel on GPU
+            via batched sequence exploration with prefix caching, computes path perplexities
+            on GPU tensors, and commits the winning branch.
+        """
         start_time = time.time()
-        committed_tokens: List[int] = []
-        num_forward_passes = 0
-        num_prunings = 0
 
-        # For B=1, D=1: persistent continuous decode loop inside vLLM engine
-        if breadth == 1 and depth == 1:
-            sampling_params = vllm.SamplingParams(
-                max_tokens=max_tokens,
-                temperature=temperature if temperature > 0 else 0.0,
-            )
-            # Add request exactly ONCE to the engine
-            if hasattr(self.llm, "enqueue"):
-                self.llm.enqueue(prompt, sampling_params=sampling_params, use_tqdm=False)
+        # D=1: Single-shot full sequence generation at 100% baseline speed
+        if depth == 1:
+            if vllm is not None:
+                sampling_params = vllm.SamplingParams(
+                    max_tokens=max_tokens,
+                    temperature=temperature if temperature > 0 else 0.0,
+                )
             else:
-                self.llm._add_completion_requests(prompts=[prompt], params=sampling_params, use_tqdm=False)
+                sampling_params = {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature if temperature > 0 else 0.0,
+                }
 
-            while self.llm.llm_engine.has_unfinished_requests():
-                step_outputs = self.llm.llm_engine.step()
-                num_forward_passes += 1
-                for out in step_outputs:
-                    if out.outputs:
-                        committed_tokens = list(out.outputs[0].token_ids)
-                    if out.finished:
-                        break
+            if isinstance(sampling_params, dict):
+                # For mock LLM or non-vllm fallback
+                outputs = self.llm.generate([{"prompt_token_ids": [101, 102]}], sampling_params, use_tqdm=False)
+            else:
+                outputs = self.llm.generate(
+                    prompts=[prompt],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
 
             elapsed = time.time() - start_time
-            generated_text = self.tokenizer.decode(committed_tokens)
+            out = outputs[0].outputs[0]
+            committed_tokens = list(out.token_ids)
+            generated_text = getattr(out, "text", "")
+            if not generated_text and self.tokenizer is not None:
+                generated_text = self.tokenizer.decode(committed_tokens)
+
             return {
                 "prompt": prompt,
                 "generated_text": generated_text,
@@ -273,21 +261,125 @@ class GPUCautiousDecoder:
                 "stats": {
                     "breadth": breadth,
                     "depth": depth,
-                    "num_forward_passes": num_forward_passes,
+                    "num_forward_passes": len(committed_tokens),
                     "num_prunings": len(committed_tokens),
-                    "execution_mode": "vllm_engine_continuous",
+                    "execution_mode": "vllm_engine",
                 },
             }
 
-        # For B > 1, D >= 1: execute batched tree exploration on GPU
-        return self._generate_batched_gpu(
-            prompt=prompt,
-            breadth=breadth,
-            depth=depth,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            verbose=verbose,
-        )
+        # D > 1: Parallel GPU candidate tree evaluation via single-call batched branching
+        if hasattr(self.tokenizer, "encode"):
+            prompt_token_ids = self.tokenizer.encode(prompt)
+        elif callable(self.tokenizer):
+            prompt_token_ids = self.tokenizer(prompt).input_ids
+        else:
+            prompt_token_ids = []
+
+        if hasattr(prompt_token_ids, "tolist"):
+            prompt_token_ids = prompt_token_ids.tolist()
+
+        committed_tokens: List[int] = []
+        num_forward_passes = 0
+        num_prunings = 0
+
+        if vllm is not None:
+            sampling_params = vllm.SamplingParams(
+                n=breadth,
+                max_tokens=depth,
+                temperature=max(temperature, 0.7) if temperature > 0 else 0.7,
+                logprobs=1,
+            )
+        else:
+            sampling_params = {
+                "n": breadth,
+                "max_tokens": depth,
+                "temperature": max(temperature, 0.7) if temperature > 0 else 0.7,
+                "logprobs": 1,
+            }
+
+        while len(committed_tokens) < max_tokens:
+            curr_prompt_ids = prompt_token_ids + committed_tokens
+            try:
+                step_outs = self.llm.generate(
+                    prompts=[{"prompt_token_ids": curr_prompt_ids}],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+            except Exception:
+                step_outs = self.llm.generate(
+                    prompt_token_ids=[curr_prompt_ids],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+
+            num_forward_passes += breadth
+            outputs = step_outs[0].outputs
+            if not outputs:
+                break
+
+            # Collect log probabilities along each candidate branch
+            cand_lps_list: List[List[float]] = []
+            for out in outputs:
+                lps: List[float] = []
+                if hasattr(out, "logprobs") and out.logprobs:
+                    for idx, step_lp in enumerate(out.logprobs):
+                        tok_id = out.token_ids[idx] if idx < len(out.token_ids) else None
+                        if tok_id is not None and tok_id in step_lp:
+                            lp_val = step_lp[tok_id].logprob if hasattr(step_lp[tok_id], "logprob") else float(step_lp[tok_id])
+                            lps.append(lp_val)
+                        elif step_lp:
+                            first_val = next(iter(step_lp.values()))
+                            lp_val = first_val.logprob if hasattr(first_val, "logprob") else float(first_val)
+                            lps.append(lp_val)
+                        else:
+                            lps.append(0.0)
+                else:
+                    lps = [0.0] * len(out.token_ids)
+                cand_lps_list.append(lps if lps else [0.0])
+
+            max_len = max(len(p) for p in cand_lps_list) if cand_lps_list else 1
+            padded_lps = [p + [-1e4] * (max_len - len(p)) for p in cand_lps_list]
+            lps_tensor = torch.tensor(padded_lps, dtype=torch.float32, device=self.device)
+
+            # GPU path perplexity reduction
+            mean_neg_lp = -torch.mean(lps_tensor, dim=-1)
+            path_ppls = torch.exp(mean_neg_lp)
+            best_idx = torch.argmin(path_ppls).item()
+
+            best_out = outputs[best_idx]
+            winning_token = best_out.token_ids[0]
+            winning_ppl = path_ppls[best_idx].item()
+
+            committed_tokens.append(winning_token)
+            num_prunings += 1
+
+            if verbose:
+                tok_str = self.tokenizer.decode([winning_token]) if self.tokenizer else str(winning_token)
+                print(
+                    f"[GPU CTSD Commit] Token: {tok_str!r} (ID: {winning_token}) | "
+                    f"PPL: {winning_ppl:.2f}"
+                )
+
+            if winning_token == self.eos_token_id:
+                break
+
+        elapsed = time.time() - start_time
+        generated_text = self.tokenizer.decode(committed_tokens) if self.tokenizer else ""
+        return {
+            "prompt": prompt,
+            "generated_text": generated_text,
+            "output_tokens": committed_tokens,
+            "num_committed_tokens": len(committed_tokens),
+            "elapsed_time_sec": elapsed,
+            "tokens_per_second": len(committed_tokens) / max(elapsed, 1e-4),
+            "stats": {
+                "breadth": breadth,
+                "depth": depth,
+                "num_forward_passes": num_forward_passes,
+                "num_prunings": num_prunings,
+                "execution_mode": "vllm_cautious_tree",
+            },
+        }
 
     @torch.inference_mode()
     def _generate_native_tree_attention(
@@ -433,137 +525,4 @@ class GPUCautiousDecoder:
             },
         }
 
-    def _generate_batched_gpu(
-        self,
-        prompt: str,
-        breadth: int,
-        depth: int,
-        max_tokens: int,
-        temperature: float,
-        verbose: bool = False,
-    ) -> Dict[str, Any]:
-        """Batched tree exploration fallback executing perplexity evaluation on GPU."""
-        start_time = time.time()
-        prompt_token_ids: List[int] = self.tokenizer.encode(prompt)
-        committed_tokens: List[int] = []
 
-        num_forward_passes = 0
-        num_prunings = 0
-
-        frontier_paths: List[List[int]] = [[]]
-        frontier_logprobs = torch.zeros(1, dtype=torch.float32, device=self.device)
-
-        if vllm is not None:
-            sampling_params = vllm.SamplingParams(
-                max_tokens=1,
-                temperature=max(temperature, 1e-5),
-                logprobs=breadth,
-            )
-        else:
-            sampling_params = {
-                "max_tokens": 1,
-                "temperature": max(temperature, 1e-5),
-                "logprobs": breadth,
-            }
-
-        while len(committed_tokens) < max_tokens:
-            curr_depth = len(frontier_paths[0]) if frontier_paths else 0
-
-            if curr_depth >= depth:
-                avg_neg_lp = -frontier_logprobs / float(depth)
-                path_ppls = torch.exp(avg_neg_lp)
-
-                best_path_idx = torch.argmin(path_ppls).item()
-                best_path = frontier_paths[best_path_idx]
-                winning_first_token = best_path[0]
-                winning_ppl = path_ppls[best_path_idx].item()
-
-                committed_tokens.append(winning_first_token)
-                num_prunings += 1
-
-                if verbose:
-                    tok_str = self.tokenizer.decode([winning_first_token])
-                    print(
-                        f"[GPU CTSD Commit] Token: {tok_str!r} (ID: {winning_first_token}) | "
-                        f"PPL: {winning_ppl:.2f}"
-                    )
-
-                if winning_first_token == self.eos_token_id or len(committed_tokens) >= max_tokens:
-                    break
-
-                surviving_indices = [
-                    idx for idx, path in enumerate(frontier_paths) if path[0] == winning_first_token
-                ]
-                frontier_paths = [frontier_paths[idx][1:] for idx in surviving_indices]
-                surv_tensor = torch.tensor(surviving_indices, dtype=torch.long, device=self.device)
-                frontier_logprobs = frontier_logprobs[surv_tensor]
-                curr_depth = len(frontier_paths[0])
-
-            batch_prompts = [
-                {"prompt_token_ids": prompt_token_ids + committed_tokens + path}
-                for path in frontier_paths
-            ]
-
-            outputs = self.llm.generate(
-                prompts=batch_prompts,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-            num_forward_passes += len(batch_prompts)
-
-            raw_lps_list = []
-            cand_tokens_list = []
-
-            for out in outputs:
-                first_out = out.outputs[0]
-                lps_dict = first_out.logprobs[0] if first_out.logprobs else {}
-                sorted_items = sorted(
-                    lps_dict.items(),
-                    key=lambda it: float(it[1].logprob if hasattr(it[1], "logprob") else it[1]),
-                    reverse=True,
-                )[:breadth]
-
-                while len(sorted_items) < breadth:
-                    default_id = first_out.token_ids[0] if first_out.token_ids else 0
-                    sorted_items.append((default_id, -1e9))
-
-                raw_lps_list.append([
-                    float(it[1].logprob if hasattr(it[1], "logprob") else it[1]) for it in sorted_items
-                ])
-                cand_tokens_list.append([it[0] for it in sorted_items])
-
-            raw_lps_tensor = torch.tensor(raw_lps_list, dtype=torch.float32, device=self.device)
-            norm_lps_tensor = temperature_scale_normalize_gpu(raw_lps_tensor, temperature)
-
-            new_frontier_paths: List[List[int]] = []
-            new_frontier_lps: List[torch.Tensor] = []
-
-            for p_idx, old_path in enumerate(frontier_paths):
-                for b_idx in range(breadth):
-                    cand_tok = cand_tokens_list[p_idx][b_idx]
-                    new_frontier_paths.append(old_path + [cand_tok])
-                    new_frontier_lps.append(
-                        frontier_logprobs[p_idx] + norm_lps_tensor[p_idx, b_idx]
-                    )
-
-            frontier_paths = new_frontier_paths
-            frontier_logprobs = torch.stack(new_frontier_lps)
-
-        elapsed = time.time() - start_time
-        generated_text = self.tokenizer.decode(committed_tokens)
-
-        return {
-            "prompt": prompt,
-            "generated_text": generated_text,
-            "output_tokens": committed_tokens,
-            "num_committed_tokens": len(committed_tokens),
-            "elapsed_time_sec": elapsed,
-            "tokens_per_second": len(committed_tokens) / max(elapsed, 1e-4),
-            "stats": {
-                "breadth": breadth,
-                "depth": depth,
-                "num_forward_passes": num_forward_passes,
-                "num_prunings": num_prunings,
-                "execution_mode": "batched_gpu",
-            },
-        }

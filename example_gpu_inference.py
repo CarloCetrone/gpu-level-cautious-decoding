@@ -76,6 +76,7 @@ def main():
     print("=" * 65)
     print(f"Baseline Throughput:     {baseline_tps:.2f} tokens/s")
     print(f"GPU CTSD Throughput:     {gpu_tps:.2f} tokens/s (B={breadth}, D={depth})")
+    print(f"Speed Ratio:             {gpu_tps / baseline_tps:.1%}")
     print(f"Forward passes executed: {gpu_result['stats']['num_forward_passes']}")
     print(f"Tree pruning decisions:  {gpu_result['stats']['num_prunings']}")
     print(f"Execution mode:          {gpu_result['stats'].get('execution_mode', 'gpu')}")
