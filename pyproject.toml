@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "torch>=2.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-gpu-cautious-decoding"
+version = "0.2.0"
+description = "GPU-Accelerated Cautious Tree Search Decoding Plugin for vLLM"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Carlo Cetrone" }
+]
+keywords = ["vllm", "decoding", "cautious-decoding", "cuda", "tree-search", "llm-inference"]
+dependencies = [
+    "torch>=2.0.0",
+    "vllm>=0.6.0",
+]
+
+[project.entry-points."vllm.general_plugins"]
+cautious_gpu = "cautious_gpu.plugin:register"
