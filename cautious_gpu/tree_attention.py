@@ -37,11 +37,13 @@ class GPUTreeTopology:
         # At depth 1: B nodes (0 to B-1)
         # At depth 2: B^2 nodes (0 to B^2-1)
         # ...
-        self.depth_offsets: List[int] = [0]
-        curr_offset = 0
-        for d in range(1, depth + 1):
-            curr_offset += breadth ** (d - 1)
-            self.depth_offsets.append(curr_offset)
+        # Calculate total tree nodes: 1 (root) + B + B^2 + ... + B^D
+        # For each node i > 0, parent index is (i - 1) // B
+        self.num_total_nodes = sum(breadth ** d for d in range(depth + 1))
+        parents = [-1]
+        for i in range(1, self.num_total_nodes):
+            parents.append((i - 1) // breadth)
+        self.tree_parent_indices = torch.tensor(parents, dtype=torch.int32, device=self.device)
 
     def get_path_node_indices(self) -> torch.Tensor:
         """Constructs [num_paths, depth] matrix giving the parent node index for each step."""
@@ -61,3 +63,11 @@ class GPUTreeTopology:
                 curr_parent = curr_parent * breadth + child_choice
 
         return path_nodes
+
+    def get_tree_attention_mask(self) -> torch.Tensor:
+        """Generates the 2D causal tree attention mask [N, N] for the full tree topology.
+
+        mask[i, j] = True if node j is an ancestor of node i (or i == j), else False.
+        """
+        from cautious_gpu.tree_kernel import build_tree_attention_mask_gpu
+        return build_tree_attention_mask_gpu(self.tree_parent_indices)

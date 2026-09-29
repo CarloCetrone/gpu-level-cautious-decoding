@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GPU-Level Cautious Tree Search Decoder with on-device scoring and pruning.
+High-Performance GPU-Level Cautious Tree Search Decoder with on-device scoring,
+vectorized perplexity reduction, and adaptive tree exploration.
 """
 
 from __future__ import annotations
 
 import time
 import torch
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -21,11 +23,63 @@ from cautious_gpu.tree_kernel import (
 from cautious_gpu.tree_attention import GPUTreeTopology
 
 
+def _extract_topk_from_vllm_output(
+    out: Any, breadth: int
+) -> Tuple[List[int], List[float], float]:
+    """Fast extraction of top-K candidate tokens and logprobs from vLLM output.
+
+    Returns:
+        candidate_token_ids: list of int
+        candidate_logprobs: list of float
+        top1_probability: probability of the top-1 candidate (0.0 to 1.0)
+    """
+    first_out = out.outputs[0]
+    logprobs_dict = first_out.logprobs[0] if first_out.logprobs else None
+
+    if not logprobs_dict:
+        # Fallback if logprobs weren't returned
+        top_token = first_out.token_ids[0] if first_out.token_ids else 0
+        return [top_token] * breadth, [0.0] + [-1e9] * (breadth - 1), 1.0
+
+    # Extract items: vLLM returns either float or Logprob object with .logprob
+    items = [
+        (tok_id, float(val.logprob if hasattr(val, "logprob") else val))
+        for tok_id, val in logprobs_dict.items()
+    ]
+    # Fast sort top-B
+    items.sort(key=lambda x: x[1], reverse=True)
+    top_items = items[:breadth]
+
+    while len(top_items) < breadth:
+        default_id = first_out.token_ids[0] if first_out.token_ids else 0
+        top_items.append((default_id, -1e9))
+
+    cand_ids = [it[0] for it in top_items]
+    cand_lps = [it[1] for it in top_items]
+    top1_prob = math.exp(min(0.0, cand_lps[0]))
+
+    return cand_ids, cand_lps, top1_prob
+
+
 class GPUCautiousDecoder:
     """High-performance GPU-level Cautious Tree Search Decoder.
 
     Executes tree scoring, temperature normalization, and path perplexity reduction
-    directly on GPU VRAM with zero host synchronization stalls.
+    directly on GPU VRAM with minimal host overhead and adaptive tree exploration.
+
+    Parameters:
+        llm: An instance of `vllm.LLM`.
+        breadth: Branching factor B (candidate branches per node).
+        depth: Maximum lookahead tree depth D before path perplexity evaluation.
+        temperature: Sampling temperature for candidate exploration.
+        max_tokens: Maximum number of tokens to commit.
+        adaptive_cautious: If True, uses confidence-guided cautious exploration
+            (greedy shortcut on confident tokens, tree search on uncertain tokens),
+            bringing execution speed to near-baseline vLLM throughput.
+        confidence_threshold: Probability threshold above which a token is deemed
+            confident enough to bypass branching (default: 0.85).
+        commit_lookahead: If True, commits the verified tokens along the winning path
+            p*, amortizing the tree search cost across multiple tokens per rollout.
     """
 
     def __init__(
@@ -35,12 +89,18 @@ class GPUCautiousDecoder:
         depth: int = 3,
         temperature: float = 0.7,
         max_tokens: int = 512,
+        adaptive_cautious: bool = True,
+        confidence_threshold: float = 0.85,
+        commit_lookahead: bool = True,
     ):
         self.llm = llm
         self.breadth = breadth
         self.depth = depth
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.adaptive_cautious = adaptive_cautious
+        self.confidence_threshold = confidence_threshold
+        self.commit_lookahead = commit_lookahead
 
         self.tokenizer = self.llm.get_tokenizer()
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -55,6 +115,9 @@ class GPUCautiousDecoder:
         depth: Optional[int] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        adaptive_cautious: Optional[bool] = None,
+        confidence_threshold: Optional[float] = None,
+        commit_lookahead: Optional[bool] = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         """Executes GPU-accelerated Cautious Tree Search Decoding."""
@@ -62,80 +125,117 @@ class GPUCautiousDecoder:
         depth = depth or self.depth
         max_tokens = max_tokens or self.max_tokens
         temperature = temperature if temperature is not None else self.temperature
+        adaptive_cautious = (
+            adaptive_cautious if adaptive_cautious is not None else self.adaptive_cautious
+        )
+        confidence_threshold = (
+            confidence_threshold if confidence_threshold is not None else self.confidence_threshold
+        )
+        commit_lookahead = (
+            commit_lookahead if commit_lookahead is not None else self.commit_lookahead
+        )
 
-        if vllm is None:
+        if vllm is None and not hasattr(self.llm, "generate"):
             raise RuntimeError(
                 "vLLM is required to execute GPUCautiousDecoder.generate(). Please install vllm."
             )
 
         start_time = time.time()
         prompt_token_ids: List[int] = self.tokenizer.encode(prompt)
-
-        # Committed tokens sequence
         committed_tokens: List[int] = []
-
-        # Active frontier sequences on the tree
-        # List of candidate paths relative to committed root: [ [token_id, ...] ]
-        frontier_paths: List[List[int]] = [[]]
-        # Tensor of accumulated temperature-scaled logprobs along the paths [num_frontier]
-        frontier_logprobs = torch.zeros(1, dtype=torch.float32, device=self.device)
 
         num_forward_passes = 0
         num_prunings = 0
+        num_greedy_shortcuts = 0
+        num_tree_explorations = 0
 
-        while len(committed_tokens) < max_tokens:
-            curr_depth = len(frontier_paths[0]) if frontier_paths else 0
+        # State for active tree frontier
+        frontier_paths: List[List[int]] = [[]]
+        frontier_logprobs = torch.zeros(1, dtype=torch.float32, device=self.device)
 
-            # When reaching depth D, evaluate and prune on GPU
-            if curr_depth >= depth:
-                # Number of candidate paths is B^D
-                # Compute path perplexities on GPU
-                avg_neg_lp = -frontier_logprobs / float(depth)
-                path_ppls = torch.exp(avg_neg_lp)
-
-                # Find best path using GPU argmin
-                best_path_idx = torch.argmin(path_ppls).item()
-                best_path = frontier_paths[best_path_idx]
-                winning_first_token = best_path[0]
-                winning_ppl = path_ppls[best_path_idx].item()
-
-                # Commit winning first token
-                committed_tokens.append(winning_first_token)
-                num_prunings += 1
-
-                if verbose:
-                    tok_str = self.tokenizer.decode([winning_first_token])
-                    print(
-                        f"[GPU CTSD Commit] Token: {tok_str!r} (ID: {winning_first_token}) | "
-                        f"PPL: {winning_ppl:.2f}"
-                    )
-
-                if winning_first_token == self.eos_token_id or len(committed_tokens) >= max_tokens:
-                    break
-
-                # GPU Pruning: Retain only the paths starting with winning_first_token,
-                # shift their paths by 1 token (re-rooting), keeping B^(D-1) remaining sequences
-                surviving_indices = [
-                    idx for idx, path in enumerate(frontier_paths) if path[0] == winning_first_token
-                ]
-                frontier_paths = [frontier_paths[idx][1:] for idx in surviving_indices]
-                surv_tensor = torch.tensor(surviving_indices, dtype=torch.long, device=self.device)
-                frontier_logprobs = frontier_logprobs[surv_tensor]
-                curr_depth = len(frontier_paths[0])
-
-            # Prepare batch for all frontier sequences
-            batch_prompts = [
-                {"prompt_token_ids": prompt_token_ids + committed_tokens + path}
-                for path in frontier_paths
-            ]
-
+        if vllm is not None:
             sampling_params = vllm.SamplingParams(
                 max_tokens=1,
                 temperature=max(temperature, 1e-5),
                 logprobs=breadth,
             )
+        else:
+            # Fallback dict for mock LLMs in unit tests
+            sampling_params = {
+                "max_tokens": 1,
+                "temperature": max(temperature, 1e-5),
+                "logprobs": breadth,
+            }
 
-            # Batched execution leveraging vLLM's Automatic Prefix Caching (APC)
+        while len(committed_tokens) < max_tokens:
+            curr_depth = len(frontier_paths[0]) if frontier_paths else 0
+
+            # -------------------------------------------------------------
+            # 1. Pruning and Path Commitment (When depth D is reached)
+            # -------------------------------------------------------------
+            if curr_depth >= depth:
+                # Vectorized Path Perplexity Reduction on GPU
+                avg_neg_lp = -frontier_logprobs / float(depth)
+                path_ppls = torch.exp(avg_neg_lp)
+                best_path_idx = torch.argmin(path_ppls).item()
+                best_path = frontier_paths[best_path_idx]
+                winning_ppl = path_ppls[best_path_idx].item()
+                num_prunings += 1
+
+                if commit_lookahead:
+                    # Multi-token commitment: Commit verified tokens along the winning path
+                    tokens_to_commit = best_path[: max_tokens - len(committed_tokens)]
+                    for tok in tokens_to_commit:
+                        committed_tokens.append(tok)
+                        if verbose:
+                            tok_str = self.tokenizer.decode([tok])
+                            print(
+                                f"[GPU CTSD Commit (Lookahead)] Token: {tok_str!r} (ID: {tok}) | "
+                                f"PPL: {winning_ppl:.2f}"
+                            )
+                        if tok == self.eos_token_id or len(committed_tokens) >= max_tokens:
+                            break
+
+                    if (
+                        committed_tokens
+                        and committed_tokens[-1] == self.eos_token_id
+                        or len(committed_tokens) >= max_tokens
+                    ):
+                        break
+
+                    # Reset tree frontier for next exploration
+                    frontier_paths = [[]]
+                    frontier_logprobs = torch.zeros(1, dtype=torch.float32, device=self.device)
+                    curr_depth = 0
+                else:
+                    # Single-token commitment: Retain surviving branches starting with winning token
+                    winning_first_token = best_path[0]
+                    committed_tokens.append(winning_first_token)
+                    if verbose:
+                        tok_str = self.tokenizer.decode([winning_first_token])
+                        print(
+                            f"[GPU CTSD Commit] Token: {tok_str!r} (ID: {winning_first_token}) | "
+                            f"PPL: {winning_ppl:.2f}"
+                        )
+                    if winning_first_token == self.eos_token_id or len(committed_tokens) >= max_tokens:
+                        break
+
+                    surviving_indices = [
+                        idx for idx, path in enumerate(frontier_paths) if path[0] == winning_first_token
+                    ]
+                    frontier_paths = [frontier_paths[idx][1:] for idx in surviving_indices]
+                    surv_tensor = torch.tensor(surviving_indices, dtype=torch.long, device=self.device)
+                    frontier_logprobs = frontier_logprobs[surv_tensor]
+                    curr_depth = len(frontier_paths[0])
+
+            # -------------------------------------------------------------
+            # 2. Batched Forward Pass Over Current Frontier
+            # -------------------------------------------------------------
+            batch_prompts = [
+                {"prompt_token_ids": prompt_token_ids + committed_tokens + path}
+                for path in frontier_paths
+            ]
+
             outputs = self.llm.generate(
                 prompts=batch_prompts,
                 sampling_params=sampling_params,
@@ -143,36 +243,47 @@ class GPUCautiousDecoder:
             )
             num_forward_passes += len(batch_prompts)
 
-            # Extract raw logprobs tensor for all frontier nodes: [num_frontier, breadth]
-            raw_lps_list = []
-            candidate_tokens_list = []
+            # -------------------------------------------------------------
+            # 3. Check for Adaptive Greedy Shortcut (at tree root)
+            # -------------------------------------------------------------
+            if adaptive_cautious and curr_depth == 0 and len(frontier_paths) == 1:
+                cand_ids, cand_lps, top1_prob = _extract_topk_from_vllm_output(outputs[0], breadth)
+                if top1_prob >= confidence_threshold:
+                    # Model is highly confident: bypass branching and commit immediately!
+                    greedy_tok = cand_ids[0]
+                    committed_tokens.append(greedy_tok)
+                    num_greedy_shortcuts += 1
+
+                    if verbose:
+                        tok_str = self.tokenizer.decode([greedy_tok])
+                        print(
+                            f"[GPU CTSD Fast Commit] Token: {tok_str!r} (ID: {greedy_tok}) | "
+                            f"Confidence: {top1_prob:.1%}"
+                        )
+
+                    if greedy_tok == self.eos_token_id or len(committed_tokens) >= max_tokens:
+                        break
+                    continue
+
+            # -------------------------------------------------------------
+            # 4. Tree Frontier Expansion with GPU Temperature Normalization
+            # -------------------------------------------------------------
+            num_tree_explorations += 1
+            raw_lps_list: List[List[float]] = []
+            candidate_tokens_list: List[List[int]] = []
 
             for out in outputs:
-                first_out = out.outputs[0]
-                logprobs_dict = first_out.logprobs[0] if first_out.logprobs else {}
-                sorted_items = sorted(
-                    logprobs_dict.items(),
-                    key=lambda it: float(it[1].logprob) if hasattr(it[1], "logprob") else float(it[1]),
-                    reverse=True,
-                )[:breadth]
+                cand_ids, cand_lps, _ = _extract_topk_from_vllm_output(out, breadth)
+                candidate_tokens_list.append(cand_ids)
+                raw_lps_list.append(cand_lps)
 
-                # Ensure exactly breadth items
-                while len(sorted_items) < breadth:
-                    default_id = first_out.token_ids[0] if first_out.token_ids else 0
-                    sorted_items.append((default_id, -1e9))
-
-                raw_lps_list.append([float(it[1].logprob if hasattr(it[1], "logprob") else it[1]) for it in sorted_items])
-                candidate_tokens_list.append([it[0] for it in sorted_items])
-
-            # Convert to GPU tensor: [num_frontier, breadth]
+            # Upload to GPU and normalize across candidate dimension
             raw_lps_tensor = torch.tensor(raw_lps_list, dtype=torch.float32, device=self.device)
-
-            # GPU Temperature Scaling & Normalization over candidate dimension
             norm_lps_tensor = temperature_scale_normalize_gpu(raw_lps_tensor, temperature)
 
             # Expand frontier paths by breadth B
             new_frontier_paths: List[List[int]] = []
-            new_frontier_lps = []
+            new_frontier_lps: List[torch.Tensor] = []
 
             for p_idx, old_path in enumerate(frontier_paths):
                 for b_idx in range(breadth):
@@ -200,5 +311,9 @@ class GPUCautiousDecoder:
                 "depth": depth,
                 "num_forward_passes": num_forward_passes,
                 "num_prunings": num_prunings,
+                "num_greedy_shortcuts": num_greedy_shortcuts,
+                "num_tree_explorations": num_tree_explorations,
+                "adaptive_cautious": adaptive_cautious,
+                "commit_lookahead": commit_lookahead,
             },
         }

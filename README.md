@@ -56,16 +56,21 @@ llm = vllm.LLM(
     gpu_memory_utilization=0.85,
 )
 
-# 2. Execute GPU Cautious Decoding
+# 2. Execute Fast GPU Cautious Decoding (Near-Baseline Speed)
 result = llm.gpu_cautious_generate(
     prompt="Explain why cautious tree search decoding improves language model reasoning:",
-    breadth=3,       # Breadth B (number of candidate tokens per branch)
-    depth=3,         # Depth D (lookahead depth, evaluates B^D = 27 sequences)
-    temperature=0.7, # Temperature scaling candidate distribution
+    breadth=3,                  # Breadth B (number of candidate tokens per branch)
+    depth=3,                    # Depth D (lookahead depth, evaluates B^D = 27 sequences)
+    temperature=0.7,            # Temperature scaling candidate distribution
     max_tokens=256,
+    adaptive_cautious=True,     # Uncertainty-guided exploration (greedy on confident, tree on uncertain)
+    confidence_threshold=0.85,  # Probability threshold for greedy shortcut
+    commit_lookahead=True,      # Commits verified tokens along winning path p*
     verbose=True,
 )
 
 print(result["generated_text"])
 print(f"Throughput: {result['tokens_per_second']:.2f} tokens/sec")
+print(f"Greedy Shortcuts: {result['stats']['num_greedy_shortcuts']}")
+print(f"Tree Explorations: {result['stats']['num_tree_explorations']}")
 ```
