@@ -83,14 +83,6 @@ class GPUCautiousDecoder:
         num_forward_passes = 0
         num_prunings = 0
 
-        # Precompute static path choices for the depth-D tree
-        num_paths = breadth ** depth
-        combinations = torch.tensor(
-            list(torch.cartesian_prod(*[torch.arange(breadth) for _ in range(depth)])),
-            dtype=torch.long,
-            device=self.device,
-        )
-
         while len(committed_tokens) < max_tokens:
             curr_depth = len(frontier_paths[0]) if frontier_paths else 0
 
@@ -127,7 +119,8 @@ class GPUCautiousDecoder:
                     idx for idx, path in enumerate(frontier_paths) if path[0] == winning_first_token
                 ]
                 frontier_paths = [frontier_paths[idx][1:] for idx in surviving_indices]
-                frontier_logprobs = frontier_logprobs[surviving_indices]
+                surv_tensor = torch.tensor(surviving_indices, dtype=torch.long, device=self.device)
+                frontier_logprobs = frontier_logprobs[surv_tensor]
                 curr_depth = len(frontier_paths[0])
 
             # Prepare batch for all frontier sequences
