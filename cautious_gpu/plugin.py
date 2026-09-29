@@ -24,23 +24,16 @@ def register():
             depth: int = 3,
             max_tokens: int = 512,
             temperature: float = 0.7,
-            adaptive_cautious: bool = True,
-            confidence_threshold: float = 0.85,
-            commit_lookahead: bool = True,
             verbose: bool = False,
         ) -> Dict[str, Any]:
-            """GPU-accelerated Cautious Tree Search Decoding.
+            """GPU-level Cautious Tree Search Decoding.
 
             Parameters:
                 prompt: Input prompt string.
                 breadth: Branching factor B (candidate branches per node).
                 depth: Lookahead exploration depth D.
                 max_tokens: Maximum tokens to generate.
-                temperature: Sampling temperature.
-                adaptive_cautious: If True, uses uncertainty-guided exploration,
-                    committing confident tokens greedily to achieve near-baseline speed.
-                confidence_threshold: Probability threshold for confident tokens (default 0.85).
-                commit_lookahead: If True, commits verified tokens along the winning path.
+                temperature: Sampling temperature for candidate distribution.
                 verbose: If True, logs step-by-step commitment info.
             """
             decoder = GPUCautiousDecoder(
@@ -49,9 +42,6 @@ def register():
                 depth=depth,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                adaptive_cautious=adaptive_cautious,
-                confidence_threshold=confidence_threshold,
-                commit_lookahead=commit_lookahead,
             )
             return decoder.generate(
                 prompt=prompt,

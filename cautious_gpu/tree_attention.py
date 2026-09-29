@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Tree Attention and static path layout generator for GPU-level execution.
+Tree Attention and static path layout generator for GPU-level execution as in Medusa.
 """
 
 from __future__ import annotations
@@ -11,11 +11,12 @@ from typing import Dict, List, Tuple
 
 
 class GPUTreeTopology:
-    """Precomputes static tensor indices for tree paths and attention masking.
+    """Precomputes static tensor indices for tree paths, attention masking, and position IDs.
 
     For a tree of breadth B and depth D:
     - Number of root-to-leaf paths: B^D
-    - Path indices are static permutations of child choices (0 to B-1).
+    - Number of candidate nodes (excluding root): sum_{d=1}^D B^d
+    - Node indices and parent pointers are computed statically on GPU.
     """
 
     def __init__(self, breadth: int = 3, depth: int = 3, device: str = "cuda"):
@@ -30,44 +31,112 @@ class GPUTreeTopology:
         # Example for B=3, D=3: (0,0,0), (0,0,1), ..., (2,2,2)
         combinations = list(itertools.product(range(breadth), repeat=depth))
         self.path_child_indices = torch.tensor(
-            combinations, dtype=torch.int32, device=self.device
+            combinations, dtype=torch.long, device=self.device
         )
 
-        # Build dynamic node mapping buffers
-        # At depth 1: B nodes (0 to B-1)
-        # At depth 2: B^2 nodes (0 to B^2-1)
+        # Candidate nodes per depth level:
+        # depth 1: B nodes (0 to B-1)
+        # depth 2: B^2 nodes
         # ...
-        # Calculate total tree nodes: 1 (root) + B + B^2 + ... + B^D
-        # For each node i > 0, parent index is (i - 1) // B
-        self.num_total_nodes = sum(breadth ** d for d in range(depth + 1))
-        parents = [-1]
-        for i in range(1, self.num_total_nodes):
-            parents.append((i - 1) // breadth)
-        self.tree_parent_indices = torch.tensor(parents, dtype=torch.int32, device=self.device)
+        self.num_nodes_per_depth = [breadth ** d for d in range(1, depth + 1)]
+        self.num_candidate_nodes = sum(self.num_nodes_per_depth)
+
+        # Depth offset of each level:
+        self.depth_offsets = [0]
+        for count in self.num_nodes_per_depth[:-1]:
+            self.depth_offsets.append(self.depth_offsets[-1] + count)
+
+        # Build candidate parent pointers [num_candidate_nodes]:
+        # For depth 1 (indices 0..B-1): parent is -1 (root / prefix)
+        # For depth > 1: node i has parent (i - B) // B
+        cand_parents = []
+        node_depths = []
+        for d_idx, count in enumerate(self.num_nodes_per_depth):
+            current_depth = d_idx + 1
+            for _ in range(count):
+                node_depths.append(current_depth)
+
+        for i in range(self.num_candidate_nodes):
+            if i < breadth:
+                cand_parents.append(-1)
+            else:
+                cand_parents.append((i - breadth) // breadth)
+
+        self.candidate_parent_indices = torch.tensor(
+            cand_parents, dtype=torch.long, device=self.device
+        )
+        self.candidate_depths = torch.tensor(
+            node_depths, dtype=torch.long, device=self.device
+        )
 
     def get_path_node_indices(self) -> torch.Tensor:
-        """Constructs [num_paths, depth] matrix giving the parent node index for each step."""
+        """Constructs [num_paths, depth] matrix giving the candidate node index for each step."""
         num_paths = self.num_paths
         depth = self.depth
         breadth = self.breadth
 
-        path_nodes = torch.zeros((num_paths, depth), dtype=torch.int32, device=self.device)
+        path_nodes = torch.zeros((num_paths, depth), dtype=torch.long, device=self.device)
         child_indices = self.path_child_indices.cpu().numpy()
 
         for p_idx in range(num_paths):
-            curr_parent = 0
+            curr_node = 0
             for d in range(depth):
-                path_nodes[p_idx, d] = curr_parent
                 child_choice = child_indices[p_idx, d]
-                # In standard full tree, node index is updated as curr_parent * B + child_choice
-                curr_parent = curr_parent * breadth + child_choice
+                if d == 0:
+                    curr_node = child_choice
+                else:
+                    curr_node = self.depth_offsets[d] + (curr_node - self.depth_offsets[d - 1]) * breadth + child_choice
+                path_nodes[p_idx, d] = curr_node
 
         return path_nodes
 
     def get_tree_attention_mask(self) -> torch.Tensor:
-        """Generates the 2D causal tree attention mask [N, N] for the full tree topology.
+        """Generates the 2D causal tree attention mask [N, N] for candidate nodes on GPU.
 
         mask[i, j] = True if node j is an ancestor of node i (or i == j), else False.
         """
         from cautious_gpu.tree_kernel import build_tree_attention_mask_gpu
-        return build_tree_attention_mask_gpu(self.tree_parent_indices)
+        return build_tree_attention_mask_gpu(self.candidate_parent_indices)
+
+    def get_4d_tree_attention_mask(
+        self, prefix_len: int, dtype: torch.dtype = torch.float32
+    ) -> torch.Tensor:
+        """Generates the 4D causal tree attention mask for Transformer models as in Medusa.
+
+        Shape: [1, 1, num_candidate_nodes, prefix_len + num_candidate_nodes]
+        - For prefix columns [0, prefix_len): All candidate nodes attend (0.0).
+        - For candidate columns [prefix_len, prefix_len + N):
+          0.0 if node j is an ancestor of node i (or i == j), -inf otherwise.
+        """
+        n = self.num_candidate_nodes
+        total_len = prefix_len + n
+
+        # Start with full -inf
+        mask_4d = torch.full(
+            (1, 1, n, total_len),
+            fill_value=float("-inf"),
+            dtype=dtype,
+            device=self.device,
+        )
+
+        # 1. All candidate nodes attend to all prefix tokens
+        if prefix_len > 0:
+            mask_4d[:, :, :, :prefix_len] = 0.0
+
+        # 2. Candidate nodes attend only to themselves and their tree ancestors
+        bool_tree_mask = self.get_tree_attention_mask()
+        mask_4d[:, :, :, prefix_len:] = torch.where(
+            bool_tree_mask,
+            torch.tensor(0.0, dtype=dtype, device=self.device),
+            torch.tensor(float("-inf"), dtype=dtype, device=self.device),
+        )
+
+        return mask_4d
+
+    def get_tree_position_ids(self, prefix_len: int) -> torch.Tensor:
+        """Generates tree position IDs reflecting depth in the tree for RoPE.
+
+        Shape: [1, num_candidate_nodes]
+        pos[0, i] = prefix_len + candidate_depth[i] - 1
+        """
+        return (prefix_len + self.candidate_depths - 1).unsqueeze(0)

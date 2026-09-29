@@ -82,6 +82,11 @@ def compute_path_perplexities_gpu(
     # Fast PyTorch vectorized GPU implementation:
     # Gather logprobs for each node and child along the paths
     depth = path_node_indices.size(1)
+    if path_node_indices.device != candidate_logprobs.device:
+        path_node_indices = path_node_indices.to(candidate_logprobs.device)
+    if path_child_indices.device != candidate_logprobs.device:
+        path_child_indices = path_child_indices.to(candidate_logprobs.device)
+
     # [num_paths, depth]
     gathered_logprobs = candidate_logprobs[path_node_indices, path_child_indices]
     sum_logprobs = gathered_logprobs.sum(dim=1)
