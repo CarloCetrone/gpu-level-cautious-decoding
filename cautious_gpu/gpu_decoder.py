@@ -204,7 +204,82 @@ class GPUCautiousDecoder:
                 verbose=verbose,
             )
 
+        # Check if in-engine stepping via vLLM engine is available (zero llm.generate() calls)
+        if hasattr(self.llm, "llm_engine") and (hasattr(self.llm, "enqueue") or hasattr(self.llm, "_add_completion_requests")):
+            return self._generate_vllm_engine(
+                prompt=prompt,
+                breadth=breadth,
+                depth=depth,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                verbose=verbose,
+            )
+
         # Fallback to batched GPU execution
+        return self._generate_batched_gpu(
+            prompt=prompt,
+            breadth=breadth,
+            depth=depth,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            verbose=verbose,
+        )
+
+    def _generate_vllm_engine(
+        self,
+        prompt: str,
+        breadth: int,
+        depth: int,
+        max_tokens: int,
+        temperature: float,
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """Continuous in-engine stepping on GPU avoiding 128 llm.generate() invocations."""
+        start_time = time.time()
+        committed_tokens: List[int] = []
+        num_forward_passes = 0
+        num_prunings = 0
+
+        # For B=1, D=1: persistent continuous decode loop inside vLLM engine
+        if breadth == 1 and depth == 1:
+            sampling_params = vllm.SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature if temperature > 0 else 0.0,
+            )
+            # Add request exactly ONCE to the engine
+            if hasattr(self.llm, "enqueue"):
+                self.llm.enqueue(prompt, sampling_params=sampling_params, use_tqdm=False)
+            else:
+                self.llm._add_completion_requests(prompts=[prompt], params=sampling_params, use_tqdm=False)
+
+            while self.llm.llm_engine.has_unfinished_requests():
+                step_outputs = self.llm.llm_engine.step()
+                num_forward_passes += 1
+                for out in step_outputs:
+                    if out.outputs:
+                        committed_tokens = list(out.outputs[0].token_ids)
+                    if out.finished:
+                        break
+
+            elapsed = time.time() - start_time
+            generated_text = self.tokenizer.decode(committed_tokens)
+            return {
+                "prompt": prompt,
+                "generated_text": generated_text,
+                "output_tokens": committed_tokens,
+                "num_committed_tokens": len(committed_tokens),
+                "elapsed_time_sec": elapsed,
+                "tokens_per_second": len(committed_tokens) / max(elapsed, 1e-4),
+                "stats": {
+                    "breadth": breadth,
+                    "depth": depth,
+                    "num_forward_passes": num_forward_passes,
+                    "num_prunings": len(committed_tokens),
+                    "execution_mode": "vllm_engine_continuous",
+                },
+            }
+
+        # For B > 1, D >= 1: execute batched tree exploration on GPU
         return self._generate_batched_gpu(
             prompt=prompt,
             breadth=breadth,
