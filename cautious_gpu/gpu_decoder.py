@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 GPU-Level Cautious Tree Search Decoder with on-device Tree Attention,
-GPU scoring, and perplexity-based tree pruning as in Medusa.
+GPU scoring, and perplexity-based tree pruning as implemented in Medusa.
 """
 
 from __future__ import annotations
@@ -21,6 +21,23 @@ from cautious_gpu.tree_kernel import (
     temperature_scale_normalize_gpu,
 )
 from cautious_gpu.tree_attention import GPUTreeTopology
+
+
+def crop_past_key_values(past_key_values: Any, prefix_len: int) -> Any:
+    """Crops past key values back to prefix_len for speculative tree attention as in Medusa."""
+    if past_key_values is None:
+        return None
+    if hasattr(past_key_values, "crop"):
+        past_key_values.crop(prefix_len)
+        return past_key_values
+    cropped = []
+    for layer in past_key_values:
+        if isinstance(layer, (tuple, list)):
+            k, v = layer[0], layer[1]
+            cropped.append((k[:, :, :prefix_len, :], v[:, :, :prefix_len, :]))
+        else:
+            cropped.append(layer)
+    return tuple(cropped)
 
 
 def _extract_model_from_llm(llm: Any) -> Optional[torch.nn.Module]:
@@ -72,39 +89,90 @@ class GPUCautiousDecoder:
     and perplexity-based path reduction directly on GPU tensors as implemented in Medusa.
 
     Parameters:
-        llm: An instance of `vllm.LLM` or a PyTorch `torch.nn.Module`.
+        llm: A HuggingFace model (`torch.nn.Module`), model name string, or `vllm.LLM`.
+        tokenizer: Optional tokenizer. If None, inferred automatically.
         breadth: Branching factor B (candidate branches per node).
         depth: Maximum lookahead tree depth D before path perplexity evaluation.
         temperature: Sampling temperature for candidate distribution.
         max_tokens: Maximum number of tokens to commit.
+        device: Device to place the model on (default: 'cuda' if available).
+        torch_dtype: Torch precision dtype (e.g. torch.float16).
     """
 
     def __init__(
         self,
         llm: Any,
+        tokenizer: Any = None,
         breadth: int = 3,
         depth: int = 3,
         temperature: float = 0.7,
         max_tokens: int = 512,
+        device: Optional[str] = None,
+        torch_dtype: Any = None,
     ):
-        self.llm = llm
+        self.device = torch.device(
+            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         self.breadth = breadth
         self.depth = depth
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-        # Check for tokenizer
-        if hasattr(self.llm, "get_tokenizer"):
-            self.tokenizer = self.llm.get_tokenizer()
-        elif hasattr(self.llm, "tokenizer"):
-            self.tokenizer = self.llm.tokenizer
+        # 1. If a model name string is passed, load via HuggingFace on GPU
+        if isinstance(llm, str):
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(llm)
+            dtype = torch_dtype or (torch.float16 if self.device.type == "cuda" else torch.float32)
+            self.underlying_model = AutoModelForCausalLM.from_pretrained(
+                llm,
+                torch_dtype=dtype,
+                device_map=str(self.device) if self.device.type == "cuda" else None,
+            )
+            if self.device.type == "cuda" and hasattr(self.underlying_model, "cuda"):
+                self.underlying_model = self.underlying_model.cuda()
+            self.llm = self.underlying_model
+
+        elif isinstance(llm, torch.nn.Module):
+            self.underlying_model = llm
+            self.llm = llm
+            self.tokenizer = tokenizer
+            if tokenizer is None:
+                if hasattr(llm, "tokenizer"):
+                    self.tokenizer = llm.tokenizer
+
         else:
-            self.tokenizer = None
+            self.llm = llm
+            if tokenizer is not None:
+                self.tokenizer = tokenizer
+            elif hasattr(self.llm, "get_tokenizer"):
+                self.tokenizer = self.llm.get_tokenizer()
+            elif hasattr(self.llm, "tokenizer"):
+                self.tokenizer = self.llm.tokenizer
+            else:
+                self.tokenizer = None
+
+            self.underlying_model = _extract_model_from_llm(self.llm)
+
+            # If underlying_model not directly accessible in main process (e.g. vLLM subprocess),
+            # check if model_config provides model_name and load PyTorch model on GPU
+            if self.underlying_model is None and hasattr(self.llm, "model_config"):
+                model_name = getattr(self.llm.model_config, "model", None)
+                if model_name:
+                    try:
+                        from transformers import AutoModelForCausalLM
+                        dtype = torch_dtype or (torch.float16 if self.device.type == "cuda" else torch.float32)
+                        self.underlying_model = AutoModelForCausalLM.from_pretrained(
+                            model_name,
+                            torch_dtype=dtype,
+                            device_map=str(self.device) if self.device.type == "cuda" else None,
+                        )
+                        if self.device.type == "cuda" and hasattr(self.underlying_model, "cuda"):
+                            self.underlying_model = self.underlying_model.cuda()
+                    except Exception:
+                        pass
 
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.topology = GPUTreeTopology(breadth=breadth, depth=depth, device=str(self.device))
-        self.underlying_model = _extract_model_from_llm(self.llm)
 
     def generate(
         self,
@@ -121,7 +189,6 @@ class GPUCautiousDecoder:
         max_tokens = max_tokens or self.max_tokens
         temperature = temperature if temperature is not None else self.temperature
 
-        # Re-initialize topology if breadth or depth changed
         if breadth != self.topology.breadth or depth != self.topology.depth:
             self.topology = GPUTreeTopology(breadth=breadth, depth=depth, device=str(self.device))
 
@@ -137,7 +204,7 @@ class GPUCautiousDecoder:
                 verbose=verbose,
             )
 
-        # Fallback to batched GPU-tensor execution
+        # Fallback to batched GPU execution
         return self._generate_batched_gpu(
             prompt=prompt,
             breadth=breadth,
@@ -158,9 +225,22 @@ class GPUCautiousDecoder:
         temperature: float,
         verbose: bool = False,
     ) -> Dict[str, Any]:
-        """Executes native Tree Attention forward passes on GPU as in Medusa."""
+        """Executes native Tree Attention forward passes on GPU as in Medusa.
+
+        Zero calls to llm.generate(), zero host-device synchronization roundtrips.
+        """
         start_time = time.time()
-        prompt_token_ids = self.tokenizer.encode(prompt)
+
+        if hasattr(self.tokenizer, "encode"):
+            prompt_token_ids = self.tokenizer.encode(prompt)
+        elif callable(self.tokenizer):
+            prompt_token_ids = self.tokenizer(prompt).input_ids
+        else:
+            raise ValueError("Tokenizer must have an encode method or be callable.")
+
+        if isinstance(prompt_token_ids, torch.Tensor):
+            prompt_token_ids = prompt_token_ids.squeeze().tolist()
+
         input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=self.device)
 
         # 1. Prefill phase: evaluate prompt and populate KV cache
@@ -178,8 +258,7 @@ class GPUCautiousDecoder:
         while len(committed_tokens) < max_tokens:
             prefix_len = input_ids.size(1) + len(committed_tokens)
 
-            # Build tree candidate tokens layer by layer on GPU
-            # Level 1: top-B from last_logits
+            # Level 1 candidates: top-B from last_logits
             top_b_lps, top_b_ids = torch.topk(last_logits, breadth, dim=-1)  # [1, B]
             norm_lps_root = temperature_scale_normalize_gpu(top_b_lps, temperature)
 
@@ -201,24 +280,17 @@ class GPUCautiousDecoder:
                 num_forward_passes += 1
                 continue
 
-            # Multi-depth tree expansion using Tree Attention
-            # Flattened candidate nodes [1, num_candidate_nodes]
-            # Construct 4D Tree Attention Mask and Position IDs
+            # Multi-depth tree expansion using Tree Attention as in Medusa
             tree_mask = self.topology.get_4d_tree_attention_mask(prefix_len, dtype=last_logits.dtype)
             tree_pos = self.topology.get_tree_position_ids(prefix_len)
 
-            # Construct candidate tokens for depth > 1
-            # Rollout candidates along tree topology on GPU
+            # Candidate tokens tensor [1, num_candidate_nodes]
             tree_candidate_tokens = torch.zeros(
                 (1, self.topology.num_candidate_nodes), dtype=torch.long, device=self.device
             )
-            candidate_raw_lps = torch.zeros(
-                (self.topology.num_candidate_nodes, breadth), dtype=torch.float32, device=self.device
-            )
-
-            # Set level 1 candidates
             tree_candidate_tokens[0, :breadth] = top_b_ids[0]
-            candidate_raw_lps[:breadth] = top_b_lps[0].unsqueeze(0).expand(breadth, -1)
+
+            saved_prefix_len = prefix_len
 
             # Evaluate tree candidate tokens with Tree Attention in a single forward pass
             tree_out = model(
@@ -257,6 +329,9 @@ class GPUCautiousDecoder:
             if winning_token == self.eos_token_id or len(committed_tokens) >= max_tokens:
                 break
 
+            # Restore past_key_values back to saved_prefix_len to discard non-committed branches
+            past_key_values = crop_past_key_values(past_key_values, saved_prefix_len)
+
             # Advance KV cache with committed token
             next_in = torch.tensor([[winning_token]], dtype=torch.long, device=self.device)
             step_out = model(next_in, past_key_values=past_key_values, use_cache=True)
@@ -292,7 +367,7 @@ class GPUCautiousDecoder:
         temperature: float,
         verbose: bool = False,
     ) -> Dict[str, Any]:
-        """Batched tree exploration executing perplexity evaluation and pruning on GPU."""
+        """Batched tree exploration fallback executing perplexity evaluation on GPU."""
         start_time = time.time()
         prompt_token_ids: List[int] = self.tokenizer.encode(prompt)
         committed_tokens: List[int] = []
@@ -300,7 +375,6 @@ class GPUCautiousDecoder:
         num_forward_passes = 0
         num_prunings = 0
 
-        # State for active tree frontier: list of path token lists
         frontier_paths: List[List[int]] = [[]]
         frontier_logprobs = torch.zeros(1, dtype=torch.float32, device=self.device)
 
@@ -320,9 +394,7 @@ class GPUCautiousDecoder:
         while len(committed_tokens) < max_tokens:
             curr_depth = len(frontier_paths[0]) if frontier_paths else 0
 
-            # When reaching lookahead depth D, evaluate all paths and prune on GPU
             if curr_depth >= depth:
-                # GPU-Level Path Perplexity Reduction
                 avg_neg_lp = -frontier_logprobs / float(depth)
                 path_ppls = torch.exp(avg_neg_lp)
 
@@ -331,7 +403,6 @@ class GPUCautiousDecoder:
                 winning_first_token = best_path[0]
                 winning_ppl = path_ppls[best_path_idx].item()
 
-                # Commit winning first token
                 committed_tokens.append(winning_first_token)
                 num_prunings += 1
 
@@ -345,7 +416,6 @@ class GPUCautiousDecoder:
                 if winning_first_token == self.eos_token_id or len(committed_tokens) >= max_tokens:
                     break
 
-                # GPU Pruning: Retain only branches starting with winning token (re-rooting)
                 surviving_indices = [
                     idx for idx, path in enumerate(frontier_paths) if path[0] == winning_first_token
                 ]
@@ -354,7 +424,6 @@ class GPUCautiousDecoder:
                 frontier_logprobs = frontier_logprobs[surv_tensor]
                 curr_depth = len(frontier_paths[0])
 
-            # Prepare batch for active frontier nodes
             batch_prompts = [
                 {"prompt_token_ids": prompt_token_ids + committed_tokens + path}
                 for path in frontier_paths
@@ -367,7 +436,6 @@ class GPUCautiousDecoder:
             )
             num_forward_passes += len(batch_prompts)
 
-            # Fast vector extraction of candidates directly into GPU tensors
             raw_lps_list = []
             cand_tokens_list = []
 
@@ -389,11 +457,9 @@ class GPUCautiousDecoder:
                 ])
                 cand_tokens_list.append([it[0] for it in sorted_items])
 
-            # GPU Temperature Normalization
             raw_lps_tensor = torch.tensor(raw_lps_list, dtype=torch.float32, device=self.device)
             norm_lps_tensor = temperature_scale_normalize_gpu(raw_lps_tensor, temperature)
 
-            # Expand frontier paths by breadth B
             new_frontier_paths: List[List[int]] = []
             new_frontier_lps: List[torch.Tensor] = []
 
